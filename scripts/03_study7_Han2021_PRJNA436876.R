@@ -1,0 +1,1893 @@
+### 2024-12-06 Rapamycin reanalysis 2024
+#for Dataset 5.PRJNA717340
+### 2024-12-06 to reload
+# run chunk 1
+# load image
+# > load("Rapamycin_reanalysis_7.PRJNA717340_V02_20250129_latest.RData") # have to change to new rdata file
+# free memory
+# > gc()
+
+
+##### 0 Packages #####
+
+# detach loaded packages and data
+detachAllPackages <- function() {
+  basic.packages <- c("package:stats","package:graphics","package:grDevices","package:utils","package:datasets","package:methods","package:base")
+  package.list <- search()[ifelse(unlist(gregexpr("package:",search()))==1,TRUE,FALSE)]
+  package.list <- setdiff(package.list,basic.packages)
+  if (length(package.list)>0)  for (package in package.list) detach(package, character.only=TRUE)
+}
+detachAllPackages()
+rm(list = ls())
+
+# load required packages 
+library(dplyr) # required for '%>%' in 'RelativeAbundancePlots'
+library(stringr)# for str_split_fixed()
+library(reshape2) # for 'melt()'; unifrac plot custom function 
+library(tidyr) # data processing
+library(phyloseq) # BIOM and sample data processing
+library(vegan) # for 'adonis()'
+library(ape) # for read.tree()
+library(DESeq2) # required for 'DESeq', 'results'
+library(ggplot2) # plots
+library(ggpubr) # improved ggplots, error bars, wilcoxon/kruskal etc
+library(patchwork) # arranging ggplots
+#library("dendextend") # color branches and labels of dendrograms
+library(openxlsx) # for createWorkbook(), addWorksheet(), writeData(), saveWorkbook()
+library(microbiome) # core microbiome calculations
+library(viridis) # for 'scale_fill_viridis()'
+library(splitstackshape) # for core microbiome matrix
+library(tidyverse) # for core microbiome matrix
+library(jsonlite) # for getDisbiome()
+library(rstatix) # for wilcox_test() etc in SCFA calculations
+library(data.table) # # rowid() in clin parameters
+library(randomForest)  # RF classifiers
+library(knitr) # GLM tables
+
+suppressPackageStartupMessages({
+  library(dplyr) # required for '%>%' in 'RelativeAbundancePlots'
+  library(stringr)# for str_split_fixed()
+  library(reshape2) # for 'melt()'; unifrac plot custom function 
+  library(tidyr) # data processing
+  library(phyloseq) # BIOM and sample data processing
+  library(vegan) # for 'adonis()'
+  library(ape) # for read.tree()
+  library(DESeq2) # required for 'DESeq', 'results'
+  library(ggplot2) # plots
+  library(ggpubr) # improved ggplots, error bars, wilcoxon/kruskal etc
+  library(patchwork) # arranging ggplots
+  #library("dendextend") # color branches and labels of dendrograms
+  library(openxlsx) # for createWorkbook(), addWorksheet(), writeData(), saveWorkbook()
+  library(microbiome) # core microbiome calculations
+  library(viridis) # for 'scale_fill_viridis()'
+  library(splitstackshape) # for core microbiome matrix
+  library(tidyverse) # for core microbiome matrix
+  library(jsonlite) # for getDisbiome()
+  library(rstatix) # for wilcox_test() etc in SCFA calculations
+  library(data.table) # # rowid() in clin parameters
+  library(randomForest)  # RF classifiers
+  library(knitr) # GLM tables
+}) 
+
+
+##### Constants and Functions #####
+
+### Constants
+# FDR cutoff for differential abundances
+fdr.threshold <- 0.01
+
+# working dir
+setwd(here::here("data/study7_PRJNA436876"))
+
+# load functions
+source(here::here("scripts/MicrobiomeFunctions.R"))
+
+##### Load Data #### 
+### input file paths
+
+inputfile.metadata <- "filereport_read_run_PRJNA436876.tsv"
+inputfile.otu <- "feature-table.tsv"
+inputfile.taxonomy <- "taxonomy.tsv"
+inputfile.tree <- "tree.nwk"
+
+##### 16S phyloseq object (ok) #####
+file_path <- "filereport_read_run_PRJNA436876.tsv"
+metadata <- read.delim(file_path, header = TRUE, sep = "\t")
+
+metadata <- metadata %>%
+  mutate(Group = case_when(
+    Sample.id %in% c("SRR6812004", "SRR6812005", "SRR6812006", "SRR6812007", "SRR6812008") ~ "Probiotics",
+    Sample.id %in% c("SRR6812009", "SRR6812010", "SRR6812012", "SRR6812013", "SRR6812014") ~ "Rapamycin",
+    Sample.id %in% c("SRR6812011", "SRR6812015", "SRR6812016", "SRR6812017", "SRR6812018") ~ "Control",
+    TRUE ~ "Unknown" # Optional: Assign "Unknown" to samples that don't match any category
+  ))
+
+# Example: drop columns where *all* entries are NA
+metadata <- metadata[, colSums(is.na(metadata)) < nrow(metadata)]
+
+write.table(metadata, file = "metadata.tsv",sep = "\t",row.names = FALSE,quote = FALSE)
+
+### mapping
+SampleData <- import_qiime_sample_data("metadata.tsv")
+
+
+### 2) FEATURE (OTU) TABLE
+
+otumat <- read.csv(inputfile.otu, sep = "\t", header = TRUE, stringsAsFactors=FALSE)
+
+# Rename the "#OTU ID" column to "OTU.ID"
+colnames(otumat)[colnames(otumat) == "X.OTU.ID"] <- "OTU.ID"
+
+# Move the first column (OTU.ID) to row names
+rownames(otumat) <- otumat$OTU.ID
+otumat$OTU.ID  <- NULL
+
+# Now convert to a phyloseq 'otu_table', specifying rows = taxa (OTUs)
+OTU <- otu_table(as.matrix(otumat), taxa_are_rows = TRUE)
+
+# Check that the column names of otumat match your sample IDs:
+colnames(otumat)
+
+
+### 3) TAXONOMY TABLE
+
+taxonomy <- read.table(
+  inputfile.taxonomy,
+  sep = "\t",
+  header = TRUE,
+  stringsAsFactors = FALSE,
+  quote = ""
+)
+
+# The taxonomy file presumably has these columns: OTU_ID, Taxon, Confidence
+# We only need the OTU_ID and Taxon columns to build the tax_table.
+# Let's move OTU_ID into row names so it matches the row names in OTU.
+
+colnames(taxonomy)[colnames(taxonomy) == "Feature.ID"] <- "OTU.ID" # Rename the "Feature.ID" column to "OTU.ID"
+
+rownames(taxonomy) <- taxonomy$OTU.ID
+taxonomy$OTU.ID <- NULL
+
+# Now split the "Taxon" column by semicolons
+tax_levels_list <- strsplit(taxonomy$Taxon, ";", fixed = TRUE)
+
+# For each row, pad or trim to 7 ranks:
+tax_levels_fixed <- lapply(tax_levels_list, function(x) {
+  # If more than 7, keep only first 7
+  if (length(x) > 7) {
+    x <- x[1:7]
+  }
+  
+  # If fewer than 7, fill the rest with "Unclassified"
+  needed <- 7 - length(x)
+  if (needed > 0) {
+    x <- c(x, rep("Unclassified", needed))
+  }
+  
+  return(x)
+})
+
+# Turn your split lists into a data frame
+taxmat <- as.data.frame(do.call(rbind, tax_levels_fixed), stringsAsFactors = FALSE)
+
+# Trim whitespace for each cell in the entire data frame
+library(stringr)
+taxmat[] <- lapply(taxmat, str_trim)
+
+# Now name the columns
+colnames(taxmat) <- c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+
+# Remainder of your code
+rownames(taxmat) <- rownames(taxonomy)
+TAX <- tax_table(as.matrix(taxmat))
+
+
+### tree data
+TreeData <- read.tree(inputfile.tree)
+# transforming all multichotomies into a series of dichotomies with one (or several) branch(es)
+# of length zero, to avoid UniFrac warning messages about unrooted trees
+# see https://github.com/joey711/phyloseq/issues/936
+TreeData <- ape::multi2di(TreeData)
+
+### phyloseq object
+qiime2.ps <- phyloseq(OTU, TAX, TreeData)
+qiime2.ps <- merge_phyloseq(qiime2.ps, SampleData)
+
+# sample data for visualization
+tempsampledata2 <- data.frame(sample_data(qiime2.ps))
+
+qiime2.ps
+# phyloseq-class experiment-level object
+# otu_table()   OTU Table:         [ 2094 taxa and 15 samples ]
+# sample_data() Sample Data:       [ 15 samples by 40 sample variables ]
+# tax_table()   Taxonomy Table:    [ 2094 taxa by 7 taxonomic ranks ]
+# phy_tree()    Phylogenetic Tree: [ 2094 tips and 2093 internal nodes ]
+
+### clean phyloseq object
+temp.ps <- tidy_phyloseq(qiime2.ps)
+# further clean mitochondria and chloroplast
+# latest SILVA classifies them at the genus level
+temp.ps <-  subset_taxa(temp.ps, Genus != "Chloroplast")
+temp.ps <-  subset_taxa(temp.ps, Genus != "Mitochondria")
+temp.ps <-  subset_taxa(temp.ps, Phylum != "")
+# also removing the "aqua" negative control
+#temp.ps <- subset_samples(temp.ps, X.SampleID != "negativ")
+
+# 1A) How many OTUs/ASVs are assigned to Bacteroidota (or Bacteroidetes)?
+table(tax_table(temp.ps)[,"Phylum"])
+
+# or a quick sum of total reads assigned to that phylum:
+psmelt(temp.ps) %>%
+  filter(Phylum %in% c("Bacteroidetes", "Bacteroidota")) %>%
+  summarise(TotalReads = sum(Abundance))
+unique(psmelt(temp.ps)$Phylum)
+
+
+# 1) Save original sample names in a vector
+original_samples <- sample_names(temp.ps)
+
+# 2) Prune low-coverage samples
+temp.ps <- prune_samples(sample_sums(temp.ps) >= 2000, temp.ps)
+
+# 3) Check which samples were removed
+removed_samples <- setdiff(original_samples, sample_names(temp.ps))
+
+# 4) Print the result
+if (length(removed_samples) == 0) {
+  cat("No samples removed.\n")
+} else {
+  cat("Removed the following samples:\n")
+  print(removed_samples)
+}
+# Removed the following samples:
+
+temp.ps
+#phyloseq-class experiment-level object
+#otu_table()   OTU Table:         [ 2549 taxa and 15 samples ]
+#sample_data() Sample Data:       [ 15 samples by 40 sample variables ]
+#tax_table()   Taxonomy Table:    [ 2549 taxa by 7 taxonomic ranks ]
+#phy_tree()    Phylogenetic Tree: [ 2549 tips and 2548 internal nodes ]
+
+summary_results <- microbiome::summarize_phyloseq(temp.ps)
+print(summary_results)
+# Compositional = NO2
+# 1] Min. number of reads = 88362] Max. number of reads = 169993] Total number of reads = 2114284] Average number of reads = 14095.25] Median number of reads = 145757] Sparsity = 0.9333333333333336] Any OTU sum to 1 or less? YES8] Number of singletons = 19] Percent of OTUs that are singletons 
+# (i.e. exactly one read detected across all samples)0.039231071008238510] Number of sample variables are: 40Sample.idsecondary_study_accessionsample_accessionsecondary_sample_accessionexperiment_accessionstudy_accessionsubmission_accessiontax_idscientific_nameinstrument_platforminstrument_modellibrary_namelibrary_layoutlibrary_strategylibrary_sourcelibrary_selectionread_countbase_countcenter_namefirst_publiclast_updatedexperiment_titlestudy_titlestudy_aliasexperiment_aliasrun_aliasfastq_bytesfastq_md5fastq_ftpfastq_asperafastq_galaxysra_bytessra_md5sra_ftpsra_asperasra_galaxysample_aliassample_titlefirst_createdGroup2
+# > print(summary_results)
+# [[1]]
+# [1] "1] Min. number of reads = 8836"
+# 
+# [[2]]
+# [1] "2] Max. number of reads = 16999"
+# 
+# [[3]]
+# [1] "3] Total number of reads = 211428"
+# 
+# [[4]]
+# [1] "4] Average number of reads = 14095.2"
+# 
+# [[5]]
+# [1] "5] Median number of reads = 14575"
+# 
+# [[6]]
+# [1] "7] Sparsity = 0.933333333333333"
+# 
+# [[7]]
+# [1] "6] Any OTU sum to 1 or less? YES"
+# 
+# [[8]]
+# [1] "8] Number of singletons = 1"
+# 
+# [[9]]
+# [1] "9] Percent of OTUs that are singletons \n        (i.e. exactly one read detected across all samples)0.0392310710082385"
+# 
+# [[10]]
+# [1] "10] Number of sample variables are: 40"
+# 
+# [[11]]
+# [1] "Sample.id"                  "secondary_study_accession"  "sample_accession"          
+# [4] "secondary_sample_accession" "experiment_accession"       "study_accession"           
+# [7] "submission_accession"       "tax_id"                     "scientific_name"           
+# [10] "instrument_platform"        "instrument_model"           "library_name"              
+# [13] "library_layout"             "library_strategy"           "library_source"            
+# [16] "library_selection"          "read_count"                 "base_count"                
+# [19] "center_name"                "first_public"               "last_updated"              
+# [22] "experiment_title"           "study_title"                "study_alias"               
+# [25] "experiment_alias"           "run_alias"                  "fastq_bytes"               
+# [28] "fastq_md5"                  "fastq_ftp"                  "fastq_aspera"              
+# [31] "fastq_galaxy"               "sra_bytes"                  "sra_md5"                   
+# [34] "sra_ftp"                    "sra_aspera"                 "sra_galaxy"                
+# [37] "sample_alias"               "sample_title"               "first_created"             
+# [40] "Group"  
+
+# cleanup
+rm(OTU, TAX, taxonomy, taxmat)
+
+
+
+##### Save Phyloseq object externally#### 
+## What phyloseq objects are in memory?
+ls()                     # lists all objects
+class(temp.ps)           # should print "phyloseq" if it exists
+
+
+# 1.  Make sure the clean object is called `clean_ps`
+clean_ps <- temp.ps            # or qiime2.ps / ps_final …
+
+# 2.  Tag samples with the study ID  ← change to your study label
+sample_data(clean_ps)$StudyID <- "PRJNA717340"
+
+saveRDS(
+  clean_ps,
+  file = here::here("data/processed/ps_PRJNA436876_clean.rds"),
+  compress = "xz"
+)
+
+message("✓ Saved cleaned phyloseq for PRJNA436876")
+
+
+
+##### Phylum and Genus Extraction from Phyloseq 
+##### Phylum/Genera compositions (ok) #####
+
+
+# Filter to keep only Control and Rapamycin groups (remove Probiotics)
+temp.ps.filtered <- subset_samples(temp.ps, Group %in% c("Control", "Rapamycin"))
+
+# Verify we have samples in both groups
+print(table(sample_data(temp.ps.filtered)$Group))
+
+# Create a new column for display purposes
+sample_data(temp.ps.filtered)$Group <- factor(
+  sample_data(temp.ps.filtered)$Group,
+  levels = c("Control", "Rapamycin"),
+  labels = c("Control", "Rapamycin (IP)")
+)
+
+# Define new group order for display
+grouporder <- c("Control", "Rapamycin (IP)")
+
+
+my_comparisons <- list(c("Control", "Rapamycin (IP)"))
+
+sample_metadata <- data.frame(sample_data(temp.ps))
+print((sample_metadata))
+
+#### Phylum by comparison group
+pseq <- microbiome::transform(temp.ps.filtered, "compositional")
+pseq <- aggregate_rare(pseq, level = "Phylum", detection = 1/1000, prevalence = 50/100)
+mysubtitle <- "Detection 0.1%, Prevalence 50%, Kruskal-Wallis p-value "
+tempplot <- plot_composition(pseq, average_by = "Group") +
+  scale_fill_brewer("Phyla", palette = "Paired") +
+  theme(axis.text.x = element_text(angle=0, hjust=0.5)) +
+  labs(x = "Group", 
+       y = "Relative abundance",
+       title = "Phylum composition") 
+tempplot$data$Sample <- as.character(tempplot$data$Sample)
+tempplot$data$Sample <- factor(x = tempplot$data$Sample, levels = grouporder)
+ps.kruskal <- kruskal.test(Abundance ~ Sample, data=tempplot$data)
+tempplot <- tempplot + labs(subtitle = paste(mysubtitle, round(ps.kruskal$p.value, digits = 4)))
+plot.PhylumComp <- tempplot
+
+print(plot.PhylumComp)
+
+##Bubble Plot for Comparison Phylum##
+bubble_table <- psmelt(pseq) %>%
+  arrange(Phylum)
+bubbleTable <- bubble_table[, c("Sample","Phylum", "Abundance", "Group")] # columns: Sample, Phylum, Abundance
+
+# Remove rows with Abundance == 0 or NA
+bubbleTable <- bubbleTable %>%
+  filter(!is.na(Abundance) & Abundance > 0)
+# Reorder factor levels here:
+bubbleTable$Group <- factor(
+  bubbleTable$Group,
+  levels = c("Control","Rapamycin", "Probiotics")
+)
+myBubblePlot <- ggplot(bubbleTable, aes(x = Group, y = Phylum)) + 
+  geom_point(aes(color = Phylum, size = Abundance), alpha = 1) +
+  xlab("Group") +
+  scale_size_continuous(limits = c(0.005, 0.6), range = c(1,25)) + 
+  theme_bw() + # remove background color
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) +  # Adjust x-axis label alignment
+  labs(
+    title = "Phylum Bubble Plot",
+    y = "Phylum",
+    x = "Group"
+  )
+
+myBubblePlot 
+plot.PhylumBubble <- myBubblePlot
+
+# to retrieve plot data
+#tempdata <- tempplot$data
+
+### Genus by comparison group
+pseq <- microbiome::transform(temp.ps.filtered, "compositional")
+# fix error by assigning empty to "unclassified"
+# src https://github.com/microbiome/microbiome/issues/113
+tax_table(pseq)[, "Genus"] <- as.character(tax_table(pseq)[, "Genus"])
+tax_table(pseq)[tax_table(pseq)[, "Genus"] == "", "Genus"] <- "Unclassified"
+tax_table(pseq)[tax_table(pseq)[, "Genus"] == "Other", "Genus"] <- "Unclassified"
+tax_table(pseq)[grepl("uncultured|unclassified", tax_table(pseq)[, "Genus"], ignore.case=TRUE), "Genus"] <- "Unclassified"
+
+pseq <- aggregate_rare(pseq, level = "Genus", detection = 1/1000, prevalence = 50/100)
+mysubtitle <- "Detection 1.25%, Prevalence 50%, Kruskal-Wallis p-value "
+tempplot <- plot_composition(pseq, average_by = "Group") +
+  scale_fill_viridis_d("Genera") +
+  theme(axis.text.x = element_text(angle=0, hjust=0.5)) +
+  labs(x = "Group", 
+       y = "Relative abundance",
+       title = "Genus composition") 
+# ADD THESE TWO LINES HERE:
+tempplot$data$Tax[tempplot$data$Tax == "Other"] <- " Unclassified"
+tempplot$data <- aggregate(Abundance ~ Sample + Tax, data = tempplot$data, FUN = sum)
+
+tempplot$data$Sample <- as.character(tempplot$data$Sample)
+tempplot$data$Sample <- factor(x = tempplot$data$Sample, levels = grouporder)
+ps.kruskal <- kruskal.test(Abundance ~ Sample, data=tempplot$data)
+tempplot <- tempplot + labs(subtitle = paste(mysubtitle, round(ps.kruskal$p.value, digits = 4)))
+plot.GenusComp <- tempplot
+
+print(plot.GenusComp)
+
+#phyloseq object to relative abundances (Genus level)
+
+bubble_table <- psmelt(pseq) %>%
+  arrange(Genus)
+
+bubble_table$Genus <- ifelse(
+  # Use case-insensitive regex:
+  grepl("(?i)(uncultured|unclassified)", bubble_table$Genus),
+  "Uncharacterized",
+  bubble_table$Genus
+)
+
+bubbleTable <- bubble_table[, c("Sample","Genus", "Abundance", "Group")] # columns: Sample, Phylum, Abundance
+# Remove rows with Abundance == 0 or NA
+bubbleTable <- bubbleTable %>%
+  filter(!is.na(Abundance) & Abundance > 0)
+
+# Reorder factor levels here:
+bubbleTable$Group<- factor(
+  bubbleTable$Group,
+  levels = c("Control","Rapamycin", "Probiotics")
+)
+
+myBubblePlot <- ggplot(bubbleTable, aes(x = Group, y = Genus)) + 
+  geom_point(aes(color = Genus, size = Abundance), alpha = 1) +
+  xlab("Group") +
+  scale_size_continuous(limits = c(0.001, 0.6), range = c(1,25)) + 
+  theme_bw() + # remove background color
+  theme(axis.text.x = element_text(angle= 45, hjust= 1)) +
+  labs(x = "Group", 
+       y = "Relative abundance",
+       title = "Genus Bubble Plot") 
+
+myBubblePlot 
+plot.GenusBubble <- myBubblePlot
+
+# to retrieve plot data
+# tempdata <- tempplot$data
+
+###combined 
+
+# Phylum plot with correct relabeling
+plot.PhylumComp <- plot.PhylumComp + 
+  scale_x_discrete(labels = c("Control" = "Control-IP", 
+                              "Rapamycin (IP)" = "Rapamycin-IP"), 
+  expand = c(0, 0)) +  # Remove gap
+  scale_y_continuous(expand = c(0, 0)) +  # Remove gap on y-axis too) +
+  labs(tag = "a", title = NULL, x=NULL, subtitle = NULL) +
+  theme(plot.tag.position = c(-0.01, 1),
+        plot.tag = element_text(size = 14, face = "plain"))
+
+# Genus plot with correct relabeling  
+plot.GenusComp <- plot.GenusComp + 
+  scale_x_discrete(labels = c("Control" = "Control-IP", 
+                              "Rapamycin (IP)" = "Rapamycin-IP"),
+                     expand = c(0, 0)) +  # Remove gap
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(tag = "b", title = NULL, x=NULL,subtitle = NULL) +
+  theme(plot.tag.position = c(-0.01, 1),
+        plot.tag = element_text(size = 14, face = "plain"))
+
+# Combine side by side
+library(patchwork)
+plot.Composition.combined <- plot.PhylumComp | plot.GenusComp
+plot.Composition.combined
+
+### cleanup
+rm(pseq, tempplot, myBubblePlot, bubbleTable, bubble_table)
+
+### Abundance tables for publication
+tempdata <- plot.PhylumComp$data
+tempdata$xlabel <- NULL
+table.Phylum.Abundance<- reshape2::dcast(tempdata, Tax ~ Sample, value.var="Abundance", fun.aggregate = sum)
+table.Phylum.Abundance$Tax <- gsub(" ", "", table.Phylum.Abundance$Tax)
+
+tempdata <- plot.GenusComp$data
+tempdata$xlabel <- NULL
+table.Genus.Abundance <- reshape2::dcast(tempdata, Tax ~ Sample, value.var="Abundance", fun.aggregate = sum)
+table.Genus.Abundance$Tax <- gsub(" ", "", table.Genus.Abundance$Tax)
+
+rm(tempdata)
+
+##### FB ratios (ok) #####
+
+pseq <- microbiome::transform(temp.ps.filtered, "compositional")
+pseq <- aggregate_rare(pseq, level = "Phylum", detection = 1/1000, prevalence = 10/100)
+tempplot <- plot_composition(pseq) 
+tempdata <- tempplot$data
+tempdata <- tempdata[, c(-4)]
+
+temp.list <- paste(c("Firmicutes", "Bacteroidota"), collapse = '|') 
+tempdata <- tempdata %>% filter(str_detect(Tax, temp.list))
+
+tempdata <- tempdata %>% 
+  #select(-Group) %>% 
+  group_by(Sample) %>%
+  spread(Tax, Abundance) 
+
+colnames(tempdata) <- gsub(" ", "", x = colnames(tempdata))
+tempdata$FBratio <- tempdata$Firmicutes / tempdata$Bacteroidota
+# Before merging, let's see what we have
+print("Structure of tempdata before merge:")
+print(str(tempdata))
+
+tempdata <- merge(tempdata, tempsampledata2, by.x=1, by.y=1)
+tempdata$logFB <- log(tempdata$FBratio) # using logs because otherwise range way too big in plot 
+
+# After the merge but before plotting, rename the groups
+tempdata$Group <- plyr::mapvalues(
+  tempdata$Group,
+  from = c("Control", "Rapamycin"),
+  to = c("Control", "Rapamycin (IP)")
+)
+
+# Add this line here to ensure correct ordering
+tempdata$Group <- factor(tempdata$Group, levels = grouporder)
+
+plot.FBratio <- ggboxplot(tempdata, x = "Group", y = "logFB", color = "Group", palette = "jco") +
+  stat_compare_means(comparisons = my_comparisons) + 
+  ylim(-1.50, 0) + # Add pairwise comparisons p-value
+  ggtitle("Firmicutes - Bacteroidetes ratios") +
+  xlab("Group") +
+  ylab("log(FB ratio)")+
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, size = 14),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 11)
+  )
+
+
+plot.FBratio
+table.FBratio <- tempdata
+str(table.FBratio)
+
+
+### mean values
+mean(table.FBratio[table.FBratio$Group == 'Control', 'FBratio'])
+mean(table.FBratio[table.FBratio$Group == 'Rapamycin (IP)', 'FBratio'])
+mean(table.FBratio[table.FBratio$Group == 'Probiotics', 'FBratio'])
+
+# > mean(table.FBratio[table.FBratio$Group == 'Control', 'FBratio'])
+# [1] 0.5500658
+# > mean(table.FBratio[table.FBratio$Group == 'Rapamycin', 'FBratio'])
+# [1] 0.3298399
+# > mean(table.FBratio[table.FBratio$Group == 'Probiotics', 'FBratio'])
+# [1] 0.3990932
+
+rm(pseq, tempplot, temp.list, tempdata)
+
+
+##### core microbiomes (ok)  #####
+
+# Check basic properties of your phyloseq objects
+print(nsamples(temp.ps))
+print(nsamples(temp.ps.filtered))
+print(ntaxa(temp.ps))
+print(ntaxa(temp.ps.filtered))
+
+# Check if sample_data exists
+print(sample_data(temp.ps))
+print(sample_data(temp.ps.filtered))
+
+### dataset cleanup
+# Create dataset without low coverage samples (<150 reads)
+psHighCov <- prune_samples(sample_sums(temp.ps.filtered) >= 150, temp.ps.filtered)
+
+# Prune unidentified Genuses; 
+# Filter out Eukaryotes, chloroplasts and mitochondria
+# ref http://deneflab.github.io/MicrobeMiseq/demos/mothur_2_phyloseq.html
+psHighCov <- subset_taxa(psHighCov,!grepl("(?i)(uncultured|unclassified)", Genus))
+psHighCov <-  subset_taxa(psHighCov, Genus != "NA")
+psHighCov <-  subset_taxa(psHighCov, Genus != "Unclassified")
+psHighCov <-  subset_taxa(psHighCov, Genus != "unclassified")
+psHighCov <-  subset_taxa(psHighCov, Genus != "uncultured")
+psHighCov <-  subset_taxa(psHighCov, Genus != "-1")
+psHighCov <-  subset_taxa(psHighCov, Genus != "Mitochondria")
+psHighCov <-  subset_taxa(psHighCov, Genus != "Chloroplast")
+
+
+### WT core
+
+scaleFUN <- function(x) {
+  x_num <- as.numeric(as.character(x)) * 100  # Convert to percentage
+  sprintf("%.1f%%", x_num)  # Format with 1 decimal
+}
+
+pseq <- subset_samples(psHighCov, Group == "Control") %>%
+  microbiome::aggregate_taxa("Genus") %>% # needed to get genera names
+  microbiome::transform("compositional")
+core_taxa_standard <- core_members(pseq, detection = 0.001, prevalence = 0.8)
+
+# cleanup taxa names from the core
+core_taxa_standard <- gsub(".*ales_", "", core_taxa_standard)
+core_taxa_standard <- gsub("___", "", core_taxa_standard)
+core_taxa_standard <- gsub("aceae_", "aceae", core_taxa_standard)
+core_taxa_standard <- gsub("aceaeunc", "aceae_unc", core_taxa_standard)
+core_taxa_standard <- gsub(".*eria_", "", core_taxa_standard)
+
+# core heatmap options
+prevalences <- seq(.05, 1, .05)
+detections <- round(10^seq(log10(0.01), log10(.2), length = 9), 3)
+gray <- gray(seq(0,1,length=5))
+
+myplot <- plot_core(pseq,
+                    plot.type = "heatmap", 
+                    colours = gray,
+                    prevalences = prevalences,
+                    detections = detections, 
+                    min.prevalence = 0.3) + 
+  labs(x = "Detection Threshold (Relative Abundance (%))")
+
+# edit long names and resort according to prevalence
+myplot$data$Taxa <- gsub(".*ales_", "", myplot$data$Taxa)
+myplot$data$Taxa <- gsub("___", "", myplot$data$Taxa)
+myplot$data$Taxa <- gsub("aceae_", "aceae", myplot$data$Taxa)
+myplot$data$Taxa <- gsub("aceaeunc", "aceae_unc", myplot$data$Taxa)
+myplot$data <- myplot$data %>% mutate(Taxa = fct_reorder(Taxa, Prevalence))
+
+# 1) Add underscore between "Lachnospiraceae" and "NK4A136_group"
+myplot$data$Taxa <- gsub(
+  "LachnospiraceaeNK4A136_group", 
+  "Lachnospiraceae_NK4A136_group", 
+  myplot$data$Taxa)
+
+# 2) Replace "LachnospiraceaeUnclassified" with "Lachnospiraceae Unclassified"
+myplot$data$Taxa <- gsub(
+  "LachnospiraceaeUnclassified", 
+  "Lachnospiraceae Unclassified", 
+  myplot$data$Taxa)
+
+# 3) Unify any "Unclassified" text to "uncultured"
+#    (using ignore.case = TRUE to catch uppercase "Unclassified" or "UNCLASSIFIED")
+myplot$data$Taxa <- gsub(
+  "Unclassified", 
+  "uncultured", 
+  myplot$data$Taxa, 
+  ignore.case = TRUE)
+
+# finally reorder or do any final manipulations
+myplot$data <- myplot$data %>%
+  mutate(Taxa = fct_reorder(Taxa, Prevalence))
+# replot
+myplot <- myplot  + scale_fill_viridis(option = "E") +
+  scale_x_discrete(labels=scaleFUN) +
+  labs(title = "Core microbiome: Control", 
+       subtitle = "detection 0.1%, prevalence 80%, min. prevalence 0.3")
+#myplot
+
+list.Core.Control <- core_taxa_standard
+plot.Core.Control<- myplot
+plot.Core.Control
+length(taxa(pseq))
+# [1] 79
+length(list.Core.Control)
+# [1] 27
+# therefore:
+# "27 out of 79 genera are shared by 80% of the subjects
+# at the minimum detection threshold of 0.1% relative abundance"
+# Shetty et al. 2017
+
+
+### Rapamycin core
+pseq <- subset_samples(psHighCov, Group == "Rapamycin (IP)") %>%
+  microbiome::aggregate_taxa("Genus") %>% # needed to get genera names
+  microbiome::transform("compositional")
+core_taxa_standard <- core_members(pseq, detection = 0.001, prevalence = 0.8)
+
+# cleanup taxa names from the core
+core_taxa_standard <- gsub(".*ales_", "", core_taxa_standard)
+core_taxa_standard <- gsub("___", "", core_taxa_standard)
+core_taxa_standard <- gsub("aceae_", "aceae", core_taxa_standard)
+core_taxa_standard <- gsub("aceaeunc", "aceae_unc", core_taxa_standard)
+core_taxa_standard <- gsub(".*eria_", "", core_taxa_standard)
+
+# core heatmap options
+prevalences <- seq(.05, 1, .05)
+detections <- round(10^seq(log10(0.01), log10(.2), length = 9), 3)
+gray <- gray(seq(0,1,length=5))
+
+myplot <- plot_core(pseq,
+                    plot.type = "heatmap", 
+                    colours = gray,
+                    prevalences = prevalences,
+                    detections = detections, 
+                    min.prevalence = 0.3) + 
+  labs(x = "Detection Threshold (Relative Abundance (%))")
+
+# edit long names and resort according to prevalence
+myplot$data$Taxa <- gsub(".*ales_", "", myplot$data$Taxa)
+myplot$data$Taxa <- gsub("___", "", myplot$data$Taxa)
+myplot$data$Taxa <- gsub("aceae_", "aceae", myplot$data$Taxa)
+myplot$data$Taxa <- gsub("aceaeunc", "aceae_unc", myplot$data$Taxa)
+myplot$data <- myplot$data %>% mutate(Taxa = fct_reorder(Taxa, Prevalence))
+
+# replot
+myplot <- myplot  + scale_fill_viridis(option = "E") +
+  scale_x_discrete(labels=scaleFUN) +
+  labs(title = "Core microbiome: Rapamycin (IP)", 
+       subtitle = "detection 0.1%, prevalence 80%, min. prevalence 0.3")
+# myplot
+
+list.Core.Rapamycin <- core_taxa_standard
+plot.Core.Rapamycin <- myplot
+length(taxa(pseq))
+# [1] 79
+length(list.Core.Rapamycin)
+# [1] 20
+# therefore:
+# "20 out of 79 genera are shared by 80% of the subjects
+# at the minimum detection threshold of 0.1% relative abundance"
+# Shetty et al. 2017
+
+##combined
+# Update Control plot - remove title, reduce right margin
+plot.Core.Control <- plot.Core.Control + 
+  labs(title = "Control",subtitle=NULL, tag = "a") +  # Changed title to NULL
+  theme(plot.tag.position = c(0.05, 1),
+        plot.tag = element_text(size = 14, face = "plain"),
+        plot.margin = unit(c(5, 2, 5, 5), "pt"),
+        legend.position = "none")    # top, right, bottom, left
+
+# Update Rapamycin plot - remove title, reduce left margin  
+plot.Core.Rapamycin <- plot.Core.Rapamycin + 
+  labs(title = "Rapamycin-IP",subtitle=NULL, tag = "b") +  # Changed title to NULL
+  theme(plot.tag.position = c(0.1, 1),
+        plot.tag = element_text(size = 14, face = "plain"),
+        plot.margin = unit(c(5, 5, 5, 2), "pt"))  # top, right, bottom, left
+
+# Combine side by side
+plot.Core.combined <- plot.Core.Control | plot.Core.Rapamycin
+plot.Core.combined
+
+# Save at 300 dpi
+ggsave(here::here("results/figS16_core_combined.png"), 
+       plot.Core.combined,
+       width = 13, height = 4, dpi = 300)
+
+### cleanup
+rm(myplot, core_taxa_standard, prevalences, detections, gray, pseq)
+
+
+##### comparison of core microbiomes (ok) #####
+
+### core vectors to presence/absence matrix
+# src https://stackoverflow.com/a/53575310
+ls(pattern="list.*Core.*")
+#[1] "list.Core.Control"   "list.Core.Rapamycin"
+
+temp_vector <- ls(pattern="list.*Core.*") 
+tempdata <- t(splitstackshape:::charMat(listOfValues = mget(temp_vector), fill = 0L)) # requires library(splitstackshape)
+colnames(tempdata) <- gsub(".*Core.", "", temp_vector)
+colnames(tempdata) <- gsub(".list", "", colnames(tempdata))
+rownames(tempdata) <- gsub(".*ales_", "", rownames(tempdata))
+rownames(tempdata) <- gsub("aceae_", "aceae", rownames(tempdata))
+rownames(tempdata) <- gsub("aceaeunc", "aceae_unc", rownames(tempdata))
+rownames(tempdata) <- gsub("\\[", "", rownames(tempdata))
+rownames(tempdata) <- gsub("\\]", "", rownames(tempdata))
+rownames(tempdata) <- gsub("_", " ", rownames(tempdata))
+rownames(tempdata) <- gsub("application_method", "gr.", rownames(tempdata))
+
+colnames(tempdata) <- c("Control", "Rapamycin")
+tempdata2 <- tempdata %>% 
+  as.data.frame() %>%
+  rownames_to_column("Genus") %>% # requires library(tidyverse)
+  pivot_longer(-c(Genus), names_to = "Group", values_to = "value")
+tempdata2$Group <- factor(tempdata2$Group, levels=c("Control", "Rapamycin"))
+
+tempplot <- ggplot(tempdata2, aes(Genus, Group)) +
+  geom_tile(aes(fill = value), colour = "black") +
+  coord_equal() + 
+  xlab('') + 
+  ylab('Group') + 
+  labs(
+    title = "Core Microbiome Comparison",
+    fill = "Presence"
+  ) + # tiles as squares
+  # coord_flip() +
+  #geom_text(aes(label = round(value, 1))) +
+  scale_fill_gradient(low = "white", high = "gray") +
+  scale_x_discrete(position = "top") + # x labels on top
+  theme(axis.text.x = element_text(angle = 90, hjust = 0),
+        axis.text.y = element_text(hjust = 0),
+        legend.position = "none")   # hide legend
+
+table.Core.comparison.matrix <- tempdata
+table.Core.comparison.matrix_for_ggplot2 <- tempdata2
+plot.Core.comparison <- tempplot
+
+### cleanup
+rm(tempdata, tempdata2, tempplot)
+
+##### bugbase () #####
+
+# data acquisition and preprocessing
+bugbase_data <- read.csv(inputfile.bugbase, sep = "\t", header = TRUE, row.names = 1)
+rownames(tempsampledata) <- tempsampledata$X.SampleID
+bugbase_data <- merge(bugbase_data, tempsampledata, by = "row.names")
+rownames(bugbase_data) <- bugbase_data$Row.names
+bugbase_data <- bugbase_data[, -c(1)]
+bugbase_data <- bugbase_data[-c(1), ] # discard negative control
+bugbase_data$Gruppe <- factor(bugbase_data$Gruppe, levels = c("Gesund", "Gingivitis", "Parodontitis"))
+names(bugbase_data)[names(bugbase_data) == 'Gruppe'] <- 'Group'
+
+# calling adhoc function
+plotBugbase2 <- function(inputTable){
+  my_comparisons <- my_comparisons
+  aerobic.plot <- ggboxplot(bugbase_data, x = "Group", y = "Aerobic", color = "Group", palette = "jco") +
+    stat_compare_means(comparisons = my_comparisons) + # Add pairwise comparisons p-value
+    xlab("") +
+    ylab("proportion") +
+    ggtitle("aerobic") +
+    theme(legend.position = "none")
+  
+  anaerobic.plot <- ggboxplot(bugbase_data, x = "Group", y = "Anaerobic", color = "Group", palette = "jco") +
+    stat_compare_means(comparisons = my_comparisons) + # Add pairwise comparisons p-value
+    xlab("") +
+    ylab("proportion") +
+    ggtitle("anaerobic") +
+    theme(legend.position = "none")
+  
+  facultative.plot <- ggboxplot(bugbase_data, x = "Group", y = "Facultatively_Anaerobic", color = "Group", palette = "jco") +
+    stat_compare_means(comparisons = my_comparisons) + # Add pairwise comparisons p-value
+    xlab("") +
+    ylab("proportion") +
+    ggtitle("facultatively anaerobic") +
+    theme(legend.position = "none")
+  
+  # stresstolerant.plot <- ggboxplot(bugbase_data, x = "Group", y = "Stress_Tolerant", color = "Group", palette = "jco") +
+  #   stat_compare_means(comparisons = my_comparisons) + # Add pairwise comparisons p-value
+  #   xlab("") +
+  #   ylab("proportion") +
+  #   ggtitle("stress tolerant") +
+  #   theme(legend.position = "none")
+  
+  pathogenic.plot <- ggboxplot(bugbase_data, x = "Group", y = "Potentially_Pathogenic", color = "Group", palette = "jco") +
+    stat_compare_means(comparisons = my_comparisons) + # Add pairwise comparisons p-value
+    xlab("") +
+    ylab("proportion") +
+    ggtitle("potentially pathogenic") +
+    theme(legend.position = "none")
+  
+  biofilms.plot <- ggboxplot(bugbase_data, x = "Group", y = "Forms_Biofilms", color = "Group", palette = "jco") +
+    stat_compare_means(comparisons = my_comparisons) + # Add pairwise comparisons p-value
+    xlab("") +
+    ylab("proportion") +
+    ggtitle("forming biofilms") +
+    theme(legend.position = "none")
+  
+  mobile.plot <- ggboxplot(bugbase_data, x = "Group", y = "Contains_Mobile_Elements", color = "Group", palette = "jco") +
+    stat_compare_means(comparisons = my_comparisons) + # Add pairwise comparisons p-value
+    xlab("") +
+    ylab("proportion") +
+    ggtitle("contains mobile elements") +
+    theme(legend.position = "none")
+  
+  # combined plot
+  bugbase.plot1 <- (aerobic.plot + anaerobic.plot + facultative.plot) / 
+    (pathogenic.plot + biofilms.plot + mobile.plot)
+  # join legends
+  bugbase.plot1 <- bugbase.plot1 + 
+    plot_layout(guides = "collect") + theme(legend.position = "right") #+
+  #plot_annotation(tag_levels = 'A')
+  
+  return(bugbase.plot1)
+}
+
+# all plots
+bugbase_data_plots <- plotBugbase2(bugbase_data)
+plot.BugBase <- bugbase_data_plots
+
+# backup table
+table.bugbase <- bugbase_data
+
+# cleanup
+rm(bugbase_data_plots, bugbase_data)
+
+##### shannon diversity (ok) #####
+# Check number of samples in each group
+
+
+
+# shannon diversity by Group
+season_std_shannon <- plot_richness(temp.ps.filtered, x = "Group", color = "Group", measures = c("Shannon")) 
+tempdata <- season_std_shannon$data
+
+tempdata$Group <- factor(tempdata$Group, levels = c("Control", "Rapamycin (IP)"))
+
+plot.Shannon.AlphaDiversity <- ggboxplot(tempdata, x = "Group", y = "value",
+                                         color = "Group", palette = "jco") +
+  stat_compare_means(comparisons = my_comparisons) + # Add pairwise comparisons p-value
+  # 2) Overall test label (Kruskal-Wallis), placed at x=1
+  stat_compare_means(
+    method = "kruskal.test",
+    label.x = 1,
+    label.y = (1.2 + max(tempdata$value))
+  ) +
+  ggtitle("Shannon diversity") +
+  xlab("Group") +
+  ylab("Alpha diversity measure")+
+  coord_cartesian(ylim = c(4, 5.5))+
+  theme(legend.position = "none")
+
+
+plot.Shannon.AlphaDiversity
+# backup table
+table.shannon <- tempdata
+
+# cleanup
+rm(tempdata)
+
+##combine
+
+# Update Shannon diversity plot - remove title, change labels and add tag
+
+# Update F/B ratio plot - remove title, change labels and add tag
+plot.FBratio <- plot.FBratio + 
+  scale_x_discrete(labels = c("Control" = "Control-IP", 
+                              "Rapamycin (IP)" = "Rapamycin-IP")) +
+  labs(tag = "a", title = NULL, subtitle = NULL, y= "log(F/B ratio)") +  # Changed to "b" and added title = NULL, subtitle = NULL
+  theme(plot.tag.position = c(-0.0, 1),
+        plot.tag = element_text(size = 14, face = "plain"),
+        legend.position = "none")
+plot.Shannon.AlphaDiversity <- plot.Shannon.AlphaDiversity + 
+  scale_x_discrete(labels = c("Control" = "Control-IP", 
+                              "Rapamycin (IP)" = "Rapamycin-IP")) +
+  labs(tag = "b", title = NULL, subtitle = NULL, y = "Shannon diversity index") +  # Added title = NULL, subtitle = NULL
+  theme(plot.tag.position = c(-0.0, 1),
+        plot.tag = element_text(size = 14, face = "plain"),
+        legend.position = "none")
+
+
+# Combine side by side
+library(patchwork)
+plot.Shannon.FBratio.combined <-plot.FBratio  |  plot.Shannon.AlphaDiversity 
+plot.Shannon.FBratio.combined
+
+##### beta diversity (Bray divergence) () #####
+
+# src https://microbiome.github.io/tutorials/Betadiversity.html
+# requires library(reshape)
+# ref Salonen et al. ISME J 2014
+# http://www.nature.com/ismej/journal/v8/n11/full/ismej201463a.html
+
+# Using temp.ps for the phyloseq object
+pseq <- temp.ps.filtered
+
+# Print sample info
+print("Sample summary:")
+print(sample_data(pseq))
+
+# Calculate Bray divergence for each group
+b.Control <- divergence(subset_samples(pseq, Group == "Control"),
+                   apply(abundances(subset_samples(pseq, Group == "Control")), 1, median))
+
+b.Rapamycin <- divergence(subset_samples(pseq, Group == "Rapamycin (IP)"),
+                        apply(abundances(subset_samples(pseq, Group == "Rapamycin (IP)")), 1, median))
+
+# b.Probiotics <- divergence(subset_samples(pseq, Group == "Probiotics"),
+#                           apply(abundances(subset_samples(pseq, Group == "Probiotics")), 1, median))
+
+
+# Combine distances into a single table
+l <- list(b.Control, b.Rapamycin)
+df <- reshape2::melt(l) # Requires library(reshape)
+
+
+# Rename groups for clarity
+df$L1[df$L1 == '1'] <- 'Control'
+df$L1[df$L1 == '2'] <- 'Rapamycin (IP)'
+#df$L1[df$L1 == '3'] <- 'Probiotics'
+
+# Set proper factor levels for ordering
+df$L1 <- factor(df$L1, levels = c("Control", "Rapamycin (IP)"))
+
+# Rename columns for clarity - FIXED ORDER BASED ON ACTUAL DATA
+bray_table <- df
+colnames(bray_table) <- c("value", "Group") # Correct order
+
+# Let's check what the dataframe looks like
+print("Structure of df after melting:")
+print(str(df))
+print("Summary of df:")
+print(summary(df))
+
+# Plot Bray Beta Diversity
+plot.Bray.BetaDiversity <- ggboxplot(bray_table, 
+                                     x = "Group", 
+                                     y = "value",
+                                     color = "Group", 
+                                     palette = "jco",
+                                     ylab = "Divergence"
+                                     ) +
+  labs(title = NULL, subtitle = NULL, x = NULL) +  # x = NULL removes "Group" label
+  scale_x_discrete(labels = c("Control" = "Control-IP",
+                              "Rapamycin (IP)" = "Rapamycin-IP")) +
+  annotate("text", x = 1.5, y = 1.05, 
+           label = "High data sparsity (93% zeros)\nAll samples show maximum dissimilarity", 
+           size = 3.5)+
+  theme(legend.position = "none")
+
+print(plot.Bray.BetaDiversity )
+# Save the table for backup
+table.betadiv <- bray_table
+
+
+# cleanup
+rm(pseq, bray_table, b.Control, b.Rapamycin,b.Probiotics, l, df)
+
+##### Beta Diversity by Franzi (ok) #####
+
+# Set up phyloseq object for analysis
+pseq <- temp.ps.filtered
+
+# Ensure the phylogenetic tree is included
+phy_tree(pseq)
+
+# Calculate Weighted UniFrac distances
+iDist <- phyloseq::distance(pseq, method = "wunifrac")
+
+# Perform PCoA ordination
+iMDS <- ordinate(pseq, method = "PCoA", distance = iDist)
+
+# Run PERMANOVA (adonis) to test for significant differences in beta diversity between groups
+wunifrac.adonis <- adonis(iDist ~ Group, 
+                          data = as(sample_data(pseq), "data.frame"), 
+                          permutations = 10000)
+
+# Extract p-value from PERMANOVA results
+tempSubtitle.here <- paste0("Adonis PERMANOVA p-value = ", 
+                            formatC(wunifrac.adonis$aov.tab$`Pr(>F)`[1], format = "f", digits = 5))
+
+# Plot the PCoA ordination, coloring by application method
+plot.unifrac.pcoa <- plot_ordination(pseq, iMDS, color = "Group") +
+  labs(title = "PCoA Ordination (Weighted UniFrac)", subtitle = tempSubtitle.here) +
+  stat_ellipse(geom = "polygon", aes(fill = Group), alpha = 0.15) +  # Add ellipses for each group
+  theme_bw()
+
+# Display the plot
+print(plot.unifrac.pcoa)
+
+
+dispersion <- betadisper(iDist, sample_data(pseq)$Group)
+anova(dispersion)
+permutest(dispersion)
+
+# Clean up
+rm(iDist, iMDS, wunifrac.adonis, tempSubtitle.here)
+
+##### Unweighted UniFrac#######
+# Set up phyloseq object for analysis
+pseq <- temp.ps.filtered
+
+# Ensure the phylogenetic tree is included
+phy_tree(pseq)
+
+# Calculate Unweighted UniFrac distances
+iDist <- phyloseq::distance(pseq, method = "unifrac")
+
+# Perform PCoA ordination
+iMDS <- ordinate(pseq, method = "PCoA", distance = iDist)
+
+# Run PERMANOVA (adonis) to test for significant differences in beta diversity between groups
+unifrac.adonis2 <- adonis2(
+  iDist ~ Group,
+  data         = as(sample_data(pseq), "data.frame"),
+  permutations = 10000,
+  by           = "margin"    # tests each term marginally
+)
+
+# Correct extraction of the p-value
+pval <- unifrac.adonis2["Group", "Pr(>F)"]
+
+# Extract p-value from PERMANOVA results
+tempSubtitle.here <- paste0("Adonis PERMANOVA p-value = ", 
+                            formatC(pval, format = "f", digits = 5))
+
+# Plot the PCoA ordination, coloring by application method
+plot.unweightedunifrac.pcoa <- plot_ordination(pseq, iMDS, color = "Group") +
+  labs(
+    title    = "PCoA Ordination (Unweighted UniFrac)",
+    subtitle = tempSubtitle.here,
+    color    = "Group"   # relabel the points/colour legend
+  )  +
+  stat_ellipse(geom = "polygon", aes(fill = Group), alpha = 0.15, 
+               show.legend = FALSE) +     # drop the fill legend here
+  theme_bw()
+
+dispersion <- betadisper(iDist, sample_data(pseq)$Group)
+anova(dispersion)
+permutest(dispersion)
+
+# Display the plot
+print(plot.unweightedunifrac.pcoa)
+
+# Clean up
+rm(iDist, iMDS, unifrac.adonis2, tempSubtitle.here)
+
+#
+# Using unfiltered phyloseq object
+temp.diagdds.unfiltered <- subset_samples(temp.ps, Group %in% c("Control", "Rapamycin"))
+diagdds.unfiltered <- phyloseq_to_deseq2(temp.diagdds.unfiltered, ~ Group)
+diagdds.unfiltered$Group <- relevel(factor(diagdds.unfiltered$Group), ref = "Control")
+geoMeans.unfiltered <- apply(counts(diagdds.unfiltered), 1, gm_mean)
+diagdds.unfiltered <- estimateSizeFactors(diagdds.unfiltered, geoMeans = geoMeans.unfiltered)
+diagdds.unfiltered <- DESeq(diagdds.unfiltered, fitType="local")
+res.unfiltered <- results(diagdds.unfiltered, cooksCutoff = FALSE)
+
+# Using filtered phyloseq object
+temp.diagdds.filtered <- subset_samples(temp.ps.filtered, Group %in% c("Control", "Rapamycin (IP)"))  
+diagdds.filtered <- phyloseq_to_deseq2(temp.diagdds.filtered, ~ Group)
+diagdds.filtered$Group <- relevel(factor(diagdds.filtered$Group), ref = "Control")
+geoMeans.filtered <- apply(counts(diagdds.filtered), 1, gm_mean)
+diagdds.filtered <- estimateSizeFactors(diagdds.filtered, geoMeans = geoMeans.filtered)
+diagdds.filtered <- DESeq(diagdds.filtered, fitType="local")
+res.filtered <- results(diagdds.filtered, cooksCutoff = FALSE)
+
+# Compare number of taxa
+print(paste("Unfiltered taxa count:", nrow(res.unfiltered)))
+print(paste("Filtered taxa count:", nrow(res.filtered)))
+
+# Compare significant hits
+sig.unfiltered <- sum(!is.na(res.unfiltered$padj) & res.unfiltered$padj < 0.01)
+sig.filtered <- sum(!is.na(res.filtered$padj) & res.filtered$padj < 0.01)
+print(paste("Significant taxa (unfiltered):", sig.unfiltered))
+print(paste("Significant taxa (filtered):", sig.filtered))
+
+# Compare range of fold changes
+fc.range.unfiltered <- range(res.unfiltered$log2FoldChange, na.rm=TRUE)
+fc.range.filtered <- range(res.filtered$log2FoldChange, na.rm=TRUE)
+print("Log2FC range (unfiltered):")
+print(fc.range.unfiltered)
+print("Log2FC range (filtered):")
+print(fc.range.filtered)
+
+# Update Weighted UniFrac plot - remove title/subtitle, change labels, add tag, remove legend
+# Calculate or manually set shared axis limits
+# Option 1: Set manually based on your data range
+x_limits <- c(-0.4, 0.5)
+y_limits <- c(-0.6, 0.6)
+
+# Update Weighted UniFrac plot
+plot.unifrac.pcoa <- plot.unifrac.pcoa + 
+  scale_color_discrete(labels = c("Control" = "Control-IP", 
+                                  "Rapamycin (IP)" = "Rapamycin-IP")) +
+  scale_fill_discrete(labels = c("Control" = "Control-IP", 
+                                 "Rapamycin (IP)" = "Rapamycin-IP")) +
+  coord_cartesian(xlim = x_limits, ylim = y_limits) +  # Add this
+  labs(tag = "a", title = NULL, subtitle = NULL) +
+  theme(plot.tag.position = c(-0.00, 1),
+        plot.tag = element_text(size = 14, face = "plain"),
+        legend.position = "none")
+
+# Update Unweighted UniFrac plot
+plot.unweightedunifrac.pcoa <- plot.unweightedunifrac.pcoa + 
+  scale_color_discrete(labels = c("Control" = "Control-IP", 
+                                  "Rapamycin (IP)" = "Rapamycin-IP")) +
+  scale_fill_discrete(labels = c("Control" = "Control-IP", 
+                                 "Rapamycin (IP)" = "Rapamycin-IP")) +
+  coord_cartesian(xlim = x_limits, ylim = y_limits) +  # Add this
+  labs(tag = "b", title = NULL, subtitle = NULL) +
+  theme(plot.tag.position = c(-0.00, 1),
+        plot.tag = element_text(size = 14, face = "plain"))
+
+# Combine side by side
+library(patchwork)
+plot.unifrac.combined <- plot.unifrac.pcoa | plot.unweightedunifrac.pcoa
+plot.unifrac.combined
+
+##### Differential abundances: Control vs Rapamycin  (ok) #####
+# Get sample read counts
+sample_sums <- phyloseq::sample_sums(temp.ps.filtered)
+
+# Compare read counts by group
+read_counts_by_group <- data.frame(
+  Reads = sample_sums,
+  Group = sample_data(temp.ps.filtered)$Group
+)
+
+# Summary statistics
+summary_stats <- aggregate(Reads ~ Group, data = read_counts_by_group, 
+                           FUN = function(x) c(mean = mean(x), 
+                                               median = median(x), 
+                                               min = min(x), 
+                                               max = max(x)))
+print(summary_stats)
+
+# Plot to compare
+ggplot(read_counts_by_group, aes(x = Group, y = Reads)) + 
+  geom_boxplot() +
+  labs(title = "Sequencing depth by treatment group")
+
+# FDR cutoff for differential abundances
+fdr.threshold <- 0.05
+print(paste("FDR threshold is:", fdr.threshold))
+
+# subsetting 
+temp.diagdds <- temp.ps
+temp.diagdds <- subset_samples(temp.ps, Group %in% c("Control", "Rapamycin"))
+
+# deseq object
+diagdds <- phyloseq_to_deseq2(temp.diagdds, ~ Group)
+
+# Set the reference level
+diagdds$Group <- relevel(factor(diagdds$Group), ref = "Control")
+
+
+# code added to avoid zeroes error; see functions' section
+geoMeans <- apply(counts(diagdds), 1, gm_mean)
+diagdds <- estimateSizeFactors(diagdds, geoMeans = geoMeans)
+diagdds <- DESeq(diagdds, fitType="local")
+
+#diagdds <- DESeq(diagdds, test="Wald", fitType="parametric")
+res <- results(diagdds, cooksCutoff = FALSE)
+head(res)
+
+print(paste("Total number of ASVs tested:", nrow(res)))
+
+# Get total counts per sample
+sample_totals <- colSums(counts(diagdds))
+
+# Calculate relative abundance (proportion of reads)
+rel_abundance <- sweep(counts(diagdds), 2, sample_totals, "/")
+
+# Set minimum relative abundance threshold (e.g., 0.001 = 0.1%)
+min_rel_abundance <- 0.0025  # Adjust this value as needed
+
+# Calculate mean relative abundance by group
+mean_rel_abundance_control <- rowMeans(rel_abundance[, colData(diagdds)$Group== "Control"])
+mean_rel_abundance_rapamycin <- rowMeans(rel_abundance[, colData(diagdds)$Group == "Rapamycin"])
+
+# Apply relative abundance filter
+abundant_taxa <- which(mean_rel_abundance_control > min_rel_abundance | 
+                         mean_rel_abundance_rapamycin > min_rel_abundance)
+res_filtered <- res[abundant_taxa, ]
+
+print(paste("ASVs after minimum count filtering:", nrow(res_filtered)))
+
+# log2 fold change (MLE): application method Rapamycin vs Control 
+# Wald test p-value: application method Rapamycin vs Control  
+# i.e. log2(Rapamycin/Control) -> COntrol as the reference
+
+# "The text, condition treated vs untreated, tells you that the 
+# estimates are of the logarithmic fold change log2(treated/untreated)."
+# source https://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#differential-expression-analysis
+
+# filter results by FDR (p-adj) < 0.01
+# Filter by both statistical significance and biological effect size
+
+#sigtab <- res[which(res$padj < fdr.threshold & abs(res$log2FoldChange) > 3), ]
+#sigtab <- cbind(as(sigtab, "data.frame"), as(tax_table(temp.diagdds)[rownames(sigtab), ], "matrix"))
+
+
+# Statistical significance and fold change filter
+sigtab <- res_filtered[which(!is.na(res_filtered$padj) & 
+                               !is.na(res_filtered$log2FoldChange) & 
+                               res_filtered$padj < fdr.threshold & 
+                               abs(res_filtered$log2FoldChange) > 3), ]
+sigtab <- cbind(as(sigtab, "data.frame"), as(tax_table(temp.diagdds)[rownames(sigtab), ], "matrix"))
+
+# Merge unclassified and uncultured taxa at genus level
+sigtab$Genus <- as.character(sigtab$Genus)  # Convert to character for manipulation
+
+# Replace 'unclassified' and variations
+unclassified_patterns <- c("unclassified", "Uncultured", "uncultured", "Uncultured","Unclassified")
+for (pattern in unclassified_patterns) {
+  sigtab$Genus[grepl(pattern, sigtab$Genus)] <- "Unclassified/Uncultured"
+}
+
+# Convert back to factor for plotting
+sigtab$Genus <- as.factor(sigtab$Genus)
+
+# # correcting cell without genera info
+# # sigtab[rownames(sigtab) == "f33bc888923d4c7b93d34b684d1cc2c7",]
+# sigtab$Genus <- as.character(sigtab$Genus)
+# sigtab[rownames(sigtab) == "f33bc888923d4c7b93d34b684d1cc2c7", "Genus"] <- "[Prevotellaceae]"
+# sigtab$Genus <- as.factor(sigtab$Genus)
+
+# Phylum order
+# x <- tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+# x <- sort(x, TRUE)
+# sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Sort by max LFC at genus level
+x <- tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x <- sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+
+# plot
+tempTitle <- "Differential Abundance by Genera"
+tempSubtitle <- paste0("Control vs Rapamycin (IP); FDR < ", fdr.threshold)
+plot.DiffAbund.Rapamycin <- ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) + geom_point(size=6) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5)) +
+  labs(title = tempTitle, subtitle = tempSubtitle) +
+  geom_hline(yintercept=0)
+plot.DiffAbund.Rapamycin
+
+
+# Create a second visualization with only top 100 most significant taxa
+# First, sort by significance (lowest padj)
+ordered_sigtab <- sigtab[order(sigtab$padj), ]
+
+# Sort by significance (lowest padj)
+ordered_sigtab <- sigtab[order(sigtab$padj), ]
+
+# Take top 50 instead of 100
+top50_sigtab <- head(ordered_sigtab, 50)
+
+# Sort these by fold change for better visualization
+x_top50 <- tapply(top50_sigtab$log2FoldChange, top50_sigtab$Genus, function(x) max(x))
+x_top50 <- sort(x_top50, TRUE)
+top50_sigtab$Genus = factor(as.character(top50_sigtab$Genus), levels=names(x_top50))
+
+# Create plot for top 50
+tempTitle_top50 <- "Top 50 Differentially Abundant Genera"
+tempSubtitle_top50 <- paste0("Rapamycin_food vs Control_food; FDR < ", fdr.threshold, 
+                             ", rel. abundance > ", min_rel_abundance*100, "%, |log2FC| > 3")
+
+# Update plot with top 50
+plot.Top50.DiffAbund.food <- ggplot(top50_sigtab, aes(x=Genus, y=log2FoldChange, color=Genus)) + 
+  geom_point(size=6) +  # Slightly larger points since fewer data
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5, size=9)) +  # Slightly larger text
+  theme(legend.position = "right") +  # Move legend to right
+  labs(title = tempTitle_top50, subtitle = tempSubtitle_top50) +
+  geom_hline(yintercept=0)
+
+# Display the plot
+plot.Top50.DiffAbund.food
+
+
+# diffex table
+table.DiffAbund.Rapamycin <- sigtab[,c(7:13,1:6)]
+# Print maximum values for each column
+options(max.print = 2000)  # Adjust this number as needed
+print(table.DiffAbund.Rapamycin)
+# DiffAbund.Gingivitis.Table <- sigtab[,c(7:13,1:6)]
+# run in case it's needed on excel
+# clip <- pipe("pbcopy", "w")
+# write.table(DiffAbund.Gingivitis.Table[,c(2,6,9,13)], file=clip, 
+#             col.names = TRUE, row.names = TRUE, quote = FALSE, sep = "\t")
+# close(clip)
+####. new ####
+
+# Merge unclassified and uncultured taxa at genus level
+sigtab$Genus <- as.character(sigtab$Genus)
+unclassified_patterns <- c("unclassified", "Uncultured", "uncultured", "Uncultured","Unclassified")
+for (pattern in unclassified_patterns) {
+  sigtab$Genus[grepl(pattern, sigtab$Genus)] <- "Unclassified/Uncultured"
+}
+
+# Sort by max LFC at genus level
+x <- tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x <- sort(x, FALSE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+
+# Add direction
+sigtab$Direction <- ifelse(sigtab$log2FoldChange > 0, "Enriched", "Depleted")
+
+# plot
+
+plot.DiffAbund.Rapamycin.clean <- ggplot(sigtab, aes(y=Genus, x=log2FoldChange, color=Direction)) + 
+  geom_vline(xintercept=0, linetype="solid", color="black", linewidth=0.5) +
+  geom_point(size=5) + 
+  scale_color_manual(values = c("Enriched" = "#17BECF", "Depleted" = "#FC8D62")) +
+  scale_x_continuous(limits = c(-30, 30), breaks = seq(-30, 30, by=5)) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.y = element_line(color = "gray90"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_line(color = "gray90"),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5),
+    axis.text.y = element_text(size=10),
+    axis.text.x = element_text(size=10),
+    legend.position = "none",
+    plot.title = element_text(face="bold", hjust=0, size=12)
+  ) +
+  labs(x = expression(log[2]~"fold change"), y = NULL)
+
+plot.DiffAbund.Rapamycin.clean
+##### Differential abundances: Control vs Probiotics (ok) #####
+# subsetting 
+temp.diagdds <- subset_samples(temp.ps, Group %in% c("Control", "Probiotics"))
+# deseq object
+diagdds <- phyloseq_to_deseq2(temp.diagdds, ~ Group)
+
+# code added to avoid zeroes error; see functions' section
+geoMeans <- apply(counts(diagdds), 1, gm_mean)
+diagdds <- estimateSizeFactors(diagdds, geoMeans = geoMeans)
+diagdds <- DESeq(diagdds, fitType="local")
+
+#diagdds <- DESeq(diagdds, test="Wald", fitType="parametric")
+res <- results(diagdds, cooksCutoff = FALSE)
+head(res)
+
+ head(res)
+ # log2 fold change (MLE): Group Probiotics vs Control 
+ # Wald test p-value: Group Probiotics vs Control 
+# i.e. log2(Probiotics/Control)
+
+# filter results by FDR (p-adj) < 0.01
+sigtab <- res[which(res$padj < fdr.threshold), ]
+sigtab <- cbind(as(sigtab, "data.frame"), as(tax_table(temp.diagdds)[rownames(sigtab), ], "matrix"))
+
+# correcting cell without genera info
+# sigtab[sigtab$Family == " Prevotellaceae", ]
+sigtab$Genus <- as.character(sigtab$Genus)
+sigtab[rownames(sigtab) == "374aa6542d0867e9dae3170b044e024c", "Genus"] <- "[Prevotellaceae]"
+sigtab[rownames(sigtab) == "20a26307116045d45a923bbfbf22de3a", "Genus"] <- "[Prevotellaceae]"
+sigtab$Genus <- as.factor(sigtab$Genus)
+
+# Sort by max LFC at genus level
+x <- tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x <- sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+
+# plot
+tempTitle <- "Differential Abundance by Genera"
+tempSubtitle <- "Probiotics vs Control; FDR < 0.01"
+plot.DiffAbund.Probiotics <- ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) + geom_point(size=6) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5)) +
+  labs(title = tempTitle, subtitle = tempSubtitle) +
+  geom_hline(yintercept=0)
+
+
+# diffex table
+table.DiffAbund.Probiotics <- sigtab[,c(7:13,1:6)]
+
+##### Differential abundances: Pathways (ok) #####
+##### Differential abundances: Pathways (ok) #####
+
+# Remove only pathway-related objects
+rm(path_abund, picrust2Abund, abundance.table, wt_samples, wt_conditions, 
+   wt_samples_meta, wt_samples_meta, wt_dds, table.DiffPathw.WT, 
+   plot.DiffPathw.WT, clean_df)
+
+
+# table abundances with KO ids
+# FDR cutoff for differential abundances
+fdr.threshold <- 0.05
+
+
+# Load PICRUSt2 pathway abundance data with the full file path
+path_abund <- read.table(here::here("data/study7_PRJNA436876/picrust2/path_abun_unstrat.tsv.gz"), 
+                         sep="\t",
+                         header=TRUE,
+                         row.names=1, 
+                         stringsAsFactors=FALSE,
+                         comment.char="")
+
+# Format similar to original picrust1Abund
+picrust2Abund <- data.frame(path_abund)
+
+# Print dimension for sanity check
+cat("Dimension of the raw PICRUSt2 abundance table:\n")
+print(dim(picrust2Abund))
+
+# Create pathway IDs in the same format as original code
+numlimit <- nrow(picrust2Abund)
+preffix <- "PWY"
+suffix <- seq(1:numlimit)
+picrust2Abund$path.id <- paste(preffix, suffix, sep = "")
+picrust2Abund$kegg.desc <- rownames(picrust2Abund)  # Use pathway IDs as descriptions for now
+
+# Extract the abundance table
+abundance.table <- picrust2Abund[, 1:(ncol(picrust2Abund)-2)]
+rownames(abundance.table) <- picrust2Abund$path.id
+cat("Dimension of raw abundance.table:\n")
+
+print(dim(abundance.table))
+cat("First few column names of abundance.table:\n")
+print(head(colnames(abundance.table)))
+
+common_samples <- intersect(colnames(abundance.table), rownames(SampleData))
+length(common_samples)  # how many samples overlap
+
+minCount <- 1000
+abundance.table <- subset(abundance.table, rowSums(abundance.table) > minCount)
+abundance.table <- abundance.table[ , order(names(abundance.table))]
+
+colnames(abundance.table)
+rownames(SampleData)
+abundance.table <- round(abundance.table)
+
+# diff abundant PATHWAYS
+abundance.ds <- DESeqDataSetFromMatrix(countData = abundance.table, 
+                                       colData = SampleData, 
+                                       design = ~sex)
+abundance.ds <- DESeq(abundance.ds, test="Wald", fitType="parametric")
+
+# filter results by FDR (p-adj) < 0.01
+# fdr.threshold <- 0.01
+
+rm(table.DiffPathw.Food, table.DiffPathw.IP)
+
+# Contrasts for IP and Food:
+# IP: "Rapamycin_IP" vs "Vehicle_IP"
+table.DiffPathw.IP <- results(
+  abundance.ds, 
+  contrast = c("sex", "Rapamycin_IP", "Vehicle_IP")
+)
+
+# Food: "Rapamycin_food" vs "Control_food"
+table.DiffPathw.Food <- results(
+  abundance.ds,
+  contrast = c("sex", "Rapamycin_food", "Control_food")
+)
+
+# Filter by FDR
+table.DiffPathw.IP   <- subset(table.DiffPathw.IP,   padj < fdr.threshold)
+table.DiffPathw.Food <- subset(table.DiffPathw.Food, padj < fdr.threshold)
+
+# Convert to data frames
+table.DiffPathw.IP   <- as.data.frame(table.DiffPathw.IP)
+table.DiffPathw.Food <- as.data.frame(table.DiffPathw.Food)
+
+# Merge IP results with path ID + description
+table.DiffPathw.IP <- merge(
+  table.DiffPathw.IP,
+  picrust2Abund[, c("path.id", "kegg.desc")],
+  by.x = "row.names",   # row names from DESeq2 result
+  by.y = "path.id"      # column in your picrust data
+)
+
+# Rename "Row.names" to "path.id"
+names(table.DiffPathw.IP)[names(table.DiffPathw.IP) == "Row.names"] <- "path.id"
+
+# Same for the food contrast
+table.DiffPathw.Food <- merge(
+  table.DiffPathw.Food,
+  picrust2Abund[, c("path.id", "kegg.desc")],
+  by.x = "row.names",
+  by.y = "path.id"
+)
+names(table.DiffPathw.Food)[names(table.DiffPathw.Food) == "Row.names"] <- "path.id"
+
+
+# IP bar plot
+plot.DiffPathw.IP <- ggplot(
+  table.DiffPathw.IP,
+  aes(
+    x   = reorder(kegg.desc, log2FoldChange),
+    y   = log2FoldChange,
+    fill = log2FoldChange > 0
+  )
+) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  guides(fill = "none") +
+  theme_minimal() +
+  labs(
+    x        = "MetaCyc Pathways",
+    y        = "Log2(Fold Change)",
+    title    = "Rapamycin_IP vs Vehicle_IP",
+    subtitle = paste0("FDR < ", fdr.threshold)
+  )
+
+print(plot.DiffPathw.IP)
+
+# Food bar plot
+plot.DiffPathw.Food <- ggplot(
+  table.DiffPathw.Food,
+  aes(
+    x   = reorder(kegg.desc, log2FoldChange),
+    y   = log2FoldChange,
+    fill = log2FoldChange > 0
+  )
+) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  guides(fill = "none") +
+  theme_minimal() +
+  labs(
+    x        = "MetaCyc Pathways",
+    y        = "Log2(Fold Change)",
+    title    = "Rapamycin_food vs Control_food",
+    subtitle = paste0("FDR < ", fdr.threshold)
+  )
+
+print(plot.DiffPathw.Food)
+
+
+# table abundances with KO ids
+picrust1Abund <- read.csv("picrust.tableL3.filtered.tsv", header = TRUE, row.names = 1, sep = "\t")
+numlimit <- length(picrust1Abund$KEGG_Pathways)
+preffix <- "PWY"
+suffix <- seq(1:numlimit)
+picrust1Abund$path.id <- paste(preffix, suffix, sep = "")
+picrust1Abund$kegg.desc <- rownames(picrust1Abund)
+
+abundance.table <- picrust1Abund[,1:60]
+rownames(abundance.table) <- picrust1Abund$path.id
+
+colnames(abundance.table) <- SampleData$Gruppe[match(colnames(abundance.table), SampleData$X.SampleID)]
+abundance.table <- abundance.table[,order(colnames(abundance.table))]
+abundance.table$aqua <- NULL
+
+# filter spurious data
+minCount <- 2000
+abundance.table <- subset(abundance.table, rowSums(abundance.table) > minCount)
+abundance.table <- abundance.table[ , order(names(abundance.table))]
+colnames(abundance.table) <- gsub("Gesund", "S", colnames(abundance.table))
+colnames(abundance.table) <- gsub("Gingivitis", "G", colnames(abundance.table))
+colnames(abundance.table) <- gsub("Parodontitis", "P", colnames(abundance.table))
+
+abundance.samples <- data.frame(row.names=colnames(abundance.table),
+                                condition=as.factor(c(rep("S",20),rep("G",19),rep("P",20))))
+# diff abundant PATHWAYS
+abundance.ds <- DESeqDataSetFromMatrix(countData = abundance.table, 
+                                       colData = abundance.samples, 
+                                       design = ~condition)
+abundance.ds <- DESeq(abundance.ds, test="Wald", fitType="parametric")
+
+# filter results by FDR (p-adj) < 0.01
+# fdr.threshold <- 0.01
+
+# contrasts
+table.DiffPathw.ParodGingi <- subset(results(abundance.ds, contrast=c("condition","P","S")), padj < fdr.threshold)
+table.DiffPathw.Gingi <- subset(results(abundance.ds, contrast=c("condition","G","S")), padj < fdr.threshold)
+table.DiffPathw.Parod <- subset(results(abundance.ds, contrast=c("condition","P","G")), padj < fdr.threshold)
+
+table.DiffPathw.ParodGingi <- as.data.frame(table.DiffPathw.ParodGingi)
+table.DiffPathw.Gingi <- as.data.frame(table.DiffPathw.Gingi) # empty table
+table.DiffPathw.Parod <- as.data.frame(table.DiffPathw.Parod)
+
+# add KEGG pathway desc
+table.DiffPathw.ParodGingi <- merge(table.DiffPathw.ParodGingi, picrust1Abund[,62:63], by.x = "row.names", by.y = "path.id")
+table.DiffPathw.Parod <- merge(table.DiffPathw.Parod, picrust1Abund[,62:63], by.x = "row.names", by.y = "path.id")
+
+# change colname to avoid duplicates later
+names(table.DiffPathw.ParodGingi)[names(table.DiffPathw.ParodGingi) == 'Row.names'] <- "path.id"
+names(table.DiffPathw.Parod)[names(table.DiffPathw.Parod) == 'Row.names'] <- "path.id"
+
+# divergent (centered stacked) bar plots
+plot.DiffPathw.ParodGingi <- ggplot(data = table.DiffPathw.ParodGingi,
+                                    aes(x = reorder(kegg.desc,log2FoldChange), y = log2FoldChange, fill = log2FoldChange > 0))+
+  geom_bar(stat = "identity") +
+  coord_flip() + # flip to horizontal
+  guides(fill = FALSE) + # delete legend
+  theme_minimal() + # delete gray background
+  labs(x = "KEGG Pathways", y = "Log2(Fold Change)",
+       title = "Parodontitis vs Healthy")
+
+plot.DiffPathw.Parod <- ggplot(data = table.DiffPathw.Parod,
+                               aes(x = reorder(kegg.desc,log2FoldChange), y = log2FoldChange, fill = log2FoldChange > 0))+
+  geom_bar(stat = "identity") +
+  coord_flip() + # flip to horizontal
+  guides(fill = FALSE) + # delete legend
+  theme_minimal() + # delete gray background
+  labs(x = "KEGG Pathways", y = "Log2(Fold Change)",
+       title = "Parodontitis vs Gingivitis")
+
+
+# (table.DiffPathw.ParodGingi.plot | table.DiffPathw.Parod.plot)
+
+
+
+
+##### clinical markers data (ok) #####
+
+### preparing clinical markers' data
+# (clinical-marker block below is from an analysis template and is not used in this study)
+# and replacing commas for points
+table.ClinicalMarkers <- read.delim(pipe("pbpaste"), dec = ",")
+
+# simplified table of clinical markers
+table.ClinicalMarkers.simplified <- table.ClinicalMarkers[, -c(2:4)]
+# add here leading string 
+table.ClinicalMarkers.simplified$Sample_ID <- sub("^", "Zahn", table.ClinicalMarkers.simplified$Sample_ID)
+colnames(table.ClinicalMarkers.simplified)[colnames(table.ClinicalMarkers.simplified) == 'STATUS'] <- 'Gruppe'
+table.ClinicalMarkers.simplified$Gruppe <- gsub("healthy", "Gesund", table.ClinicalMarkers.simplified$Gruppe)
+table.ClinicalMarkers.simplified$Gruppe <- gsub("gingivitis", "Gingivitis", table.ClinicalMarkers.simplified$Gruppe)
+table.ClinicalMarkers.simplified$Gruppe <- gsub("periodontitis", "Parodontitis", table.ClinicalMarkers.simplified$Gruppe)
+colnames(table.ClinicalMarkers.simplified)[colnames(table.ClinicalMarkers.simplified) == 'IL1β'] <- 'IL1beta'
+colnames(table.ClinicalMarkers.simplified)[colnames(table.ClinicalMarkers.simplified) == 'TNFα'] <- 'TNFalpha'
+colnames(table.ClinicalMarkers.simplified)[colnames(table.ClinicalMarkers.simplified) == 'IFNγ'] <- 'IFNgamma'
+colnames(table.ClinicalMarkers.simplified)[colnames(table.ClinicalMarkers.simplified) == 'TGFβ1'] <- 'TGFbeta1'
+table.ClinicalMarkers.simplified <- table.ClinicalMarkers.simplified[complete.cases(table.ClinicalMarkers.simplified),]
+
+# obtaining the means by Gruppe
+table.ClinicalMarkers.means <- table.ClinicalMarkers.simplified %>%
+  group_by(Gruppe) %>%
+  summarise(across(everything(), mean))
+
+
+
+##### plots (in progress) #####
+
+### 2024-07-22 Exported as PDF
+pdf("7.RapamycinAnalysis_20250505_V05.pdf", width = 14, height = 10)
+plot.PhylumCompSample
+plot.PhylumComp # phylum composition 0,1% detection 50% Prevelance
+plot.GenusComp # genus composition
+plot.PhylumBubble #Phylum Bubbleplot
+plot.GenusBubble #Genus Bubbleplot
+plot.FBratio # FB plot
+plot.Core.Control# Core microbiome control_food
+plot.Core.Rapamycin
+#plot.Core.Probiotics # Core microbiome Rapamycin_food
+plot.Core.comparison# Core microbiome comparison
+#plot.BugBase # BugBase
+plot.Shannon.AlphaDiversity # Shannon alpha diversity
+plot.Bray.BetaDiversity# Bray divergence (beta div)
+plot.unifrac.pcoa #new BEta diversity made after Franzis script (betadiv #2)
+plot.unweightedunifrac.pcoa
+plot.DiffAbund.Rapamycin + geom_segment(aes(xend = Genus, yend = 0)) # Diff Abd G vs H min rel abundance 0.25%
+#plot.Top100.DiffAbund.Rapamycin
+dev.off()
+-------------------------------------------------------------------
+  dev.off()
+plot.RF.Parod_Gingi + 
+  labs(title="Microbial biomarkers via supervised ML (RF)", subtitle="Parodontitis and Gingivitis")
+plot.RF.all +
+  labs(title="Microbial biomarkers via supervised ML (RF)", subtitle="all groups")
+
+dev.off()
+
+##### tables (in progress) #####
+
+table.Phylum.Abundance # phylum composition
+table.Genus.Abundance # genus composition
+table.FBratio # FB ratios
+list.Core.WT # Core microbiome Healthy
+list.Core.WT_RAPA # Core microbiome Gingivitis
+table.Core.comparison.matrix # Core microbiome comparison
+table.Core.comparison.matrix_for_ggplot2 # Core microbiome comparison f ggplot2
+#table.bugbase # BugBase
+table.shannon # Shannon alpha diversity
+table.betadiv # Bray divergence (beta div)
+table.DiffAbund.WT# Diff abundance Gingivitis vs Healthy
+---------------------------------------------------------------------
+  table.DiffPathw.Gingi # Diff pathways Gingivitis vs Healthy (EMPTY TABLE)
+table.DiffPathw.Parod # Diff pathways Parod vs Healthy
+table.DiffPathw.ParodGingi # Diff pathways Parod vs Gingivitis
+
+table.ClinicalMarkers # clinical markers; use for publication
+table.ClinicalMarkers.simplified # clinical markers; used for analyses
+table.ClinicalMarkers.means # means by group of 'table.ClinicalMarkers.simplified'
+
+table.correlation.Gesnd # correlations genera vs healthy (no signif correlations)
+table.correlation.Gingi # correlations genera vs gingivitis 
+table.correlation.Perod # correlations genera vs perodontitis (no signif correlations)
+
+table.RF.Parod_Gingi # RF classifiers (P vs Gingi)
+table.RF.all # RF classifiers (all groups)
+
+##### excel output (ok) #####
+
+# new excel object
+wb <- createWorkbook("dentalmicrobiome_20220722_01.xlsx")
+
+# copy table list then cmd line:
+# $ pbpaste | gsed 's/\s\#.*//' | gawk '{gsub ("table.", ""); print "addWorksheet(wb, \x27"$1"\x27)"}' | pbcopy
+addWorksheet(wb, 'Phylum.Abundance')
+addWorksheet(wb, 'Genus.Abundance')
+addWorksheet(wb, 'FBratio')
+# addWorksheet(wb, 'list.Core.Gesund')
+# addWorksheet(wb, 'list.Core.Gingi')
+# addWorksheet(wb, 'list.Core.Parod')
+# addWorksheet(wb, 'Core.comparison.matrix')
+# addWorksheet(wb, 'Core.comparison.matrix_for_ggplot2')
+addWorksheet(wb, 'bugbase')
+addWorksheet(wb, 'shannon')
+addWorksheet(wb, 'betadiv')
+addWorksheet(wb, 'DiffAbund.Gingivitis')
+addWorksheet(wb, 'DiffAbund.Parodontitis')
+addWorksheet(wb, 'DiffAbund.ParodGingi')
+addWorksheet(wb, 'DiffPathw.Gingi')
+addWorksheet(wb, 'DiffPathw.Parod')
+addWorksheet(wb, 'DiffPathw.ParodGingi')
+# addWorksheet(wb, 'ClinicalMarkers')
+addWorksheet(wb, 'ClinicalMarkers.simplified')
+# addWorksheet(wb, 'ClinicalMarkers.means')
+addWorksheet(wb, 'correlation.Gesnd')
+addWorksheet(wb, 'correlation.Gingi')
+addWorksheet(wb, 'correlation.Perod')
+addWorksheet(wb, 'RF.Parod_Gingi')
+
+# $ pbpaste | gsed 's/\s\#.*//' | gawk '{gsub ("table.", ""); print "writeData(wb, \x27"$1"\x27, "$1", rowNames = FALSE)"}' | pbcopy
+writeData(wb, 'Phylum.Abundance', table.Phylum.Abundance, rowNames = FALSE)
+writeData(wb, 'Genus.Abundance', table.Genus.Abundance, rowNames = FALSE)
+writeData(wb, 'FBratio', table.FBratio, rowNames = FALSE)
+# writeData(wb, 'list.Core.Gesund', list.Core.Gesund, rowNames = FALSE)
+# writeData(wb, 'list.Core.Gingi', list.Core.Gingi, rowNames = FALSE)
+# writeData(wb, 'list.Core.Parod', list.Core.Parod, rowNames = FALSE)
+# writeData(wb, 'Core.comparison.matrix', table.Core.comparison.matrix, rowNames = FALSE)
+# writeData(wb, 'Core.comparison.matrix_for_ggplot2', table.Core.comparison.matrix_for_ggplot2, rowNames = FALSE)
+writeData(wb, 'bugbase', table.bugbase, rowNames = FALSE)
+writeData(wb, 'shannon', table.shannon, rowNames = FALSE)
+writeData(wb, 'betadiv', table.betadiv, rowNames = FALSE)
+writeData(wb, 'DiffAbund.Gingivitis', table.DiffAbund.Gingivitis, rowNames = FALSE)
+writeData(wb, 'DiffAbund.Parodontitis', table.DiffAbund.Parodontitis, rowNames = FALSE)
+writeData(wb, 'DiffAbund.ParodGingi', table.DiffAbund.ParodGingi, rowNames = FALSE)
+writeData(wb, 'DiffPathw.Gingi', table.DiffPathw.Gingi, rowNames = FALSE)
+writeData(wb, 'DiffPathw.Parod', table.DiffPathw.Parod, rowNames = FALSE)
+writeData(wb, 'DiffPathw.ParodGingi', table.DiffPathw.ParodGingi, rowNames = FALSE)
+# writeData(wb, 'ClinicalMarkers', table.ClinicalMarkers, rowNames = FALSE)
+writeData(wb, 'ClinicalMarkers.simplified', table.ClinicalMarkers.simplified, rowNames = FALSE)
+# writeData(wb, 'ClinicalMarkers.means', table.ClinicalMarkers.means, rowNames = FALSE)
+writeData(wb, 'correlation.Gesnd', table.correlation.Gesnd, rowNames = FALSE)
+writeData(wb, 'correlation.Gingi', table.correlation.Gingi, rowNames = FALSE)
+writeData(wb, 'correlation.Perod', table.correlation.Perod, rowNames = FALSE)
+writeData(wb, 'RF.Parod_Gingi', table.RF.Parod_Gingi, rowNames = FALSE)
+
+# saving excel
+saveWorkbook(wb, file = "dentalmicrobiome_20220722_01.xlsx", overwrite = TRUE)
+
+# cleanup
+rm(wb)
+
+##### image #####
+# Save the current R workspace
+save.image("Rapamycin_reanalysis_7.PRJNA436876_V04_20250505_latest.RData")
+
+# Load the saved workspace for later use
+load("Rapamycin_reanalysis_7.PRJNA436876_V04_20250505_latest.RData")
+
+# Print the session information
+sessionInfo()
+
+# R version 4.4.2 (2024-10-31)
+# Platform: aarch64-apple-darwin20
+# Running under: macOS Sequoia 15.2
+# 
+# attached base packages:
+#   [1] stats4    stats     graphics  grDevices utils     datasets  methods   base     
+# 
+# other attached packages:
+#   [1] knitr_1.49                  randomForest_4.7-1.2        data.table_1.16.4          
+# [4] rstatix_0.7.2               jsonlite_1.8.9              lubridate_1.9.4            
+# [7] forcats_1.0.0               purrr_1.0.2                 readr_2.1.5                
+# [10] tibble_3.2.1                tidyverse_2.0.0             splitstackshape_1.4.8      
+# [13] viridis_0.6.5               viridisLite_0.4.2           microbiome_1.28.0          
+# [16] openxlsx_4.2.7.1            patchwork_1.3.0             ggpubr_0.6.0               
+# [19] ggplot2_3.5.1               DESeq2_1.46.0               SummarizedExperiment_1.36.0
+# [22] Biobase_2.66.0              MatrixGenerics_1.18.1       matrixStats_1.5.0          
+# [25] GenomicRanges_1.58.0        GenomeInfoDb_1.42.1         IRanges_2.40.1             
+# [28] S4Vectors_0.44.0            BiocGenerics_0.52.0         ape_5.8-1                  
+# [31] vegan_2.6-8                 lattice_0.22-6              permute_0.9-7              
+# [34] phyloseq_1.50.0             tidyr_1.3.1                 reshape2_1.4.4             
+# [37] stringr_1.5.1               dplyr_1.1.4                
+# 
+# loaded via a namespace (and not attached):
+#   [1] gridExtra_2.3           rlang_1.1.4             magrittr_2.0.3          ade4_1.7-22            
+# [5] compiler_4.4.2          mgcv_1.9-1              vctrs_0.6.5             pkgconfig_2.0.3        
+# [9] crayon_1.5.3            backports_1.5.0         XVector_0.46.0          labeling_0.4.3         
+# [13] utf8_1.2.4              tzdb_0.4.0              UCSC.utils_1.2.0        xfun_0.50              
+# [17] zlibbioc_1.52.0         biomformat_1.34.0       rhdf5filters_1.18.0     DelayedArray_0.32.0    
+# [21] Rhdf5lib_1.28.0         BiocParallel_1.40.0     broom_1.0.7             parallel_4.4.2         
+# [25] cluster_2.1.8           R6_2.5.1                RColorBrewer_1.1-3      stringi_1.8.4          
+# [29] car_3.1-3               Rcpp_1.0.14             iterators_1.0.14        timechange_0.3.0       
+# [33] Matrix_1.7-1            splines_4.4.2           igraph_2.1.2            tidyselect_1.2.1       
+# [37] rstudioapi_0.17.1       abind_1.4-8             codetools_0.2-20        plyr_1.8.9             
+# [41] withr_3.0.2             evaluate_1.0.3          Rtsne_0.17              survival_3.8-3         
+# [45] zip_2.3.1               Biostrings_2.74.1       pillar_1.10.1           carData_3.0-5          
+# [49] foreach_1.5.2           generics_0.1.3          hms_1.1.3               munsell_0.5.1          
+# [53] scales_1.3.0            glue_1.8.0              tools_4.4.2             locfit_1.5-9.10        
+# [57] ggsignif_0.6.4          rhdf5_2.50.2            grid_4.4.2              colorspace_2.1-1       
+# [61] nlme_3.1-166            GenomeInfoDbData_1.2.13 Formula_1.2-5           cli_3.6.3              
+# [65] S4Arrays_1.6.0          gtable_0.3.6            ggsci_3.2.0             digest_0.6.37          
+# [69] SparseArray_1.6.0       farver_2.1.2            multtest_2.62.0         lifecycle_1.0.4        
+# [73] httr_1.4.7              MASS_7.3-64   
