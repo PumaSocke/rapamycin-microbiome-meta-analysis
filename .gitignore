@@ -1,0 +1,21 @@
+# Outputs written by the scripts
+results/*
+!results/.gitkeep
+# Intermediate files the per-study scripts write next to their inputs
+data/*/shifted_sample_metadata.tsv
+data/study7_PRJNA436876/metadata.tsv
+
+# Raw and large data (download from ENA/SRA instead)
+*.fastq
+*.fastq.gz
+*.fq.gz
+*.qza
+*.qzv
+*.RData
+*.Rdata
+!data/processed/*.rds
+
+# R / system
+.Rhistory
+.Rproj.user/
+.DS_Store
